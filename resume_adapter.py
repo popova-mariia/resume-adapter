@@ -1,39 +1,4 @@
 #!/usr/bin/env python3
-"""
-Resume Adapter - local, privacy-first demo for an Agentic AI workshop.
-
-WHAT IT DOES
-  Paste a job description + your resume. Highlight (or auto-detect) sensitive
-  info like your name/phone/email. Those are replaced with placeholder tokens
-  LOCALLY, in your browser, before anything is sent. Only the redacted text is
-  sent to Groq. When Groq replies, the original values are put back in, locally.
-
-PRIVACY MODEL (read this)
-  * Redaction happens in the browser BEFORE any network call.
-  * The Groq call is made by THIS local proxy, not the browser, so your API key
-    is never exposed to the page.
-  * The ONLY data that leaves your machine is the redacted resume + the job text.
-  * This is still a cloud call: Groq sees the redacted resume. It does NOT see
-    whatever you redacted. Redact carefully; verify Groq's current data policy.
-
-SETUP
-  1) Get a free Groq API key at https://console.groq.com  (no credit card).
-  2) In a terminal:
-        export GROQ_API_KEY="your_key_here"     # macOS/Linux
-        set    GROQ_API_KEY=your_key_here        # Windows cmd
-        $env:GROQ_API_KEY="your_key_here"        # Windows PowerShell
-  3) python3 resume_adapter.py
-  4) Open http://127.0.0.1:8765 in your browser.
-
-NOTES / THINGS TO VERIFY (I flagged these honestly):
-  * Model id below ("llama-3.3-70b-versatile") was current in 2026 sources but
-    model availability changes. If you get a model error, pick a current one at
-    https://console.groq.com/docs/models
-  * Free-tier rate limits change; a single demo is fine. Verify at
-    https://console.groq.com/settings/limits
-  * Do NOT commit this file with your key in it, and do NOT deploy it publicly:
-    the key lives only in your local environment variable, keep it that way.
-"""
 
 import http.server
 import socketserver
@@ -140,11 +105,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:800]
             self._json(502, {"error": "Groq returned HTTP %s. %s" % (exc.code, detail)})
-        except Exception as exc:  # noqa: BLE001 - surface any failure to the UI
+        except Exception as exc:
             self._json(502, {"error": "Call failed: %s" % exc})
 
     def log_message(self, *args):
-        return  # keep the console quiet during a live demo
+        return
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -244,7 +209,7 @@ PAGE = r"""<!DOCTYPE html>
 
 <script>
 const $ = id => document.getElementById(id);
-let map = {};            // { "[[RID_1]]": "John Tan", ... }
+let map = {};
 let counter = 0;
 
 function nextPh() { counter += 1; return "[[RID_" + counter + "]]"; }
@@ -331,7 +296,6 @@ $("goBtn").onclick = async () => {
     if (!res.ok) { flash("errBanner", data.error || ("Error " + res.status)); return; }
 
     let out = data.result || "";
-    // verify placeholders survived BEFORE restoring
     const missing = Object.keys(map).filter(ph => !out.includes(ph));
     if (missing.length) {
       const lostItems = missing.map(ph => map[ph]).join(", ");
@@ -344,7 +308,6 @@ $("goBtn").onclick = async () => {
         " redaction(s) verified and restored locally.";
       $("okBanner").style.display = "block";
     }
-    // restore whatever placeholders are present
     Object.entries(map).forEach(([ph, orig]) => { out = out.split(ph).join(orig); });
     $("result").textContent = out;
   } catch (err) {
