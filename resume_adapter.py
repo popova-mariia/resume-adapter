@@ -15,7 +15,8 @@ PORT = int(os.environ.get("PORT", "8765"))
 SYSTEM_PROMPT = (
     "You are a resume-tailoring assistant. You receive a JOB DESCRIPTION and a "
     "candidate's RESUME. Some sensitive details in the resume have been replaced "
-    "with placeholder tokens that look like [[RID_1]], [[RID_2]], and so on.\n\n"
+    "with placeholder tokens that look like [[RID_1]], [[RID_2]], and so on. You "
+    "may also receive a CANDIDATE SELF-ASSESSMENT.\n\n"
     "PLACEHOLDER RULE (critical): Treat every [[RID_n]] token as an opaque, fixed "
     "string. Reproduce each one EXACTLY where it appears. Never modify, translate, "
     "remove, merge, or invent placeholder tokens.\n\n"
@@ -23,32 +24,51 @@ SYSTEM_PROMPT = (
     "candidate's genuine, existing experience is expressed using the terminology "
     "and keywords found in the job description, to improve relevance and keyword "
     "match for applicant tracking systems.\n\n"
+    "USING THE CANDIDATE SELF-ASSESSMENT (if present): It lists skills the job asks "
+    "for, each with the candidate's own rating of their experience. Treat each "
+    "rating as a truthful first-person statement by the candidate, and let it guide "
+    "emphasis and the gap list:\n"
+    "- 'Experienced / advanced' or 'Working knowledge': you may surface and "
+    "emphasize this skill using the job's terminology, even if the resume mentions "
+    "it only briefly.\n"
+    "- 'Basic - some familiarity': you may mention it modestly and honestly (e.g. "
+    "'exposure to'), never as a core strength.\n"
+    "- 'No hands-on experience' (or a skill the candidate omitted from the "
+    "assessment): do NOT present it as a strength. If the job requires it, put it "
+    "under 'Gaps to consider'.\n"
+    "- The self-assessment adjusts emphasis and the gap list only. It never "
+    "licenses inventing specific projects, employers, dates, tools, certifications, "
+    "or metrics. Describe every skill only in the general terms the candidate's own "
+    "materials and ratings support.\n\n"
     "INTEGRITY RULES (do not break):\n"
     "- Do NOT invent skills, tools, employers, dates, certifications, degrees, or "
-    "achievements that the resume does not already support. Only rephrase and "
-    "surface what is genuinely present.\n"
-    "- If the job wants something the resume lacks, do not fabricate it. You may "
-    "note, in a short separate 'Gaps to consider' section at the very end, which "
-    "required items appear to be missing so the candidate can address them "
-    "honestly.\n"
+    "achievements that neither the resume nor the self-assessment supports. Only "
+    "rephrase and surface what is genuinely present or genuinely claimed.\n"
+    "- If the job wants something the candidate lacks, do not fabricate it. Note "
+    "it in a short separate 'Gaps to consider' section at the very end so the "
+    "candidate can address it honestly.\n"
     "- Keep all [[RID_n]] placeholders verbatim.\n"
     "- Keep the tone professional and the content truthful.\n\n"
     "Output the tailored resume text, followed by the optional 'Gaps to consider' "
     "section. Do not add commentary before or after."
 )
 
+SKILLS_SYSTEM_PROMPT = (
+    "You extract the concrete skills, tools, technologies, and qualifications that "
+    "a job description asks for. Return ONLY a JSON object of exactly this form:\n"
+    '{"skills": ["Python", "AWS", "Stakeholder management"]}\n'
+    "Rules: each item is a short label of 1-4 words, not a full sentence; include "
+    "the 8-15 most important; no duplicates; no explanations or text outside the "
+    "JSON."
+)
 
-def call_groq(redacted_resume, job_text):
+
+def groq_chat(messages, temperature=0.3):
+    """Generic Groq chat-completions call. Returns the assistant message text."""
     payload = {
         "model": MODEL,
-        "temperature": 0.3,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content":
-                "JOB DESCRIPTION:\n" + job_text +
-                "\n\n---\n\nRESUME (sensitive parts already redacted):\n" +
-                redacted_resume},
-        ],
+        "temperature": temperature,
+        "messages": messages,
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(GROQ_URL, data=data, method="POST")
@@ -62,6 +82,83 @@ def call_groq(redacted_resume, job_text):
     return body["choices"][0]["message"]["content"]
 
 
+def format_assessment(skills):
+    """Turn [{skill, level}, ...] into a plain-text block, or '' if empty."""
+    if not skills:
+        return ""
+    lines = []
+    for item in skills:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("skill") or "").strip()
+        level = (item.get("level") or "").strip()
+        if name and level:
+            lines.append("- %s: %s" % (name, level))
+    if not lines:
+        return ""
+    return (
+        "CANDIDATE SELF-ASSESSMENT (the candidate's own first-person ratings of "
+        "their experience with skills this job asks for; treat each as a truthful "
+        "statement by the candidate):\n" + "\n".join(lines)
+    )
+
+
+def call_groq(redacted_resume, job_text, skills=None):
+    assessment = format_assessment(skills)
+    user_parts = ["JOB DESCRIPTION:\n" + job_text]
+    if assessment:
+        user_parts.append(assessment)
+    user_parts.append("RESUME (sensitive parts already redacted):\n" + redacted_resume)
+    user_content = "\n\n---\n\n".join(user_parts)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    return groq_chat(messages, temperature=0.3)
+
+
+def extract_json(text):
+    """Best-effort: pull the first JSON object or array out of a text blob."""
+    text = (text or "").strip()
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start = text.find(open_ch)
+        end = text.rfind(close_ch)
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except ValueError:
+                continue
+    return None
+
+
+def extract_skills(job_text):
+    messages = [
+        {"role": "system", "content": SKILLS_SYSTEM_PROMPT},
+        {"role": "user", "content": "JOB DESCRIPTION:\n" + job_text},
+    ]
+    raw = groq_chat(messages, temperature=0.1)
+    parsed = extract_json(raw)
+    if isinstance(parsed, dict):
+        maybe = parsed.get("skills", [])
+    elif isinstance(parsed, list):
+        maybe = parsed
+    else:
+        maybe = []
+    skills, seen = [], set()
+    for s in maybe:
+        if isinstance(s, str):
+            label = s.strip()
+        elif isinstance(s, dict):
+            label = (s.get("skill") or s.get("name") or "").strip()
+        else:
+            label = ""
+        key = label.lower()
+        if label and key not in seen:
+            seen.add(key)
+            skills.append(label)
+    return skills[:15]
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, ctype, body_bytes):
         self.send_response(code)
@@ -73,6 +170,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, "application/json", json.dumps(obj).encode("utf-8"))
 
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length) or b"{}")
+
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
@@ -80,19 +181,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/api/rewrite":
+        if self.path == "/api/skills":
+            self.handle_skills()
+        elif self.path == "/api/rewrite":
+            self.handle_rewrite()
+        else:
             self._json(404, {"error": "not found"})
-            return
+
+    def handle_skills(self):
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length) or b"{}")
-            resume = payload.get("resume", "")
+            payload = self._read_body()
             job = payload.get("job", "")
         except (ValueError, TypeError) as exc:
             self._json(400, {"error": "Bad request: %s" % exc})
             return
-        if not resume.strip() or not job.strip():
-            self._json(400, {"error": "Please provide both a job description and a resume."})
+        if not job.strip():
+            self._json(400, {"error": "Please paste the job description first."})
             return
         if not GROQ_API_KEY:
             self._json(500, {"error":
@@ -100,7 +204,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "See the setup notes at the top of resume_adapter.py."})
             return
         try:
-            result = call_groq(resume, job)
+            skills = extract_skills(job)
+            self._json(200, {"skills": skills})
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:800]
+            self._json(502, {"error": "Groq returned HTTP %s. %s" % (exc.code, detail)})
+        except Exception as exc:
+            self._json(502, {"error": "Call failed: %s" % exc})
+
+    def handle_rewrite(self):
+        try:
+            payload = self._read_body()
+            resume = payload.get("resume", "")
+            job = payload.get("job", "")
+            skills = payload.get("skills", [])
+        except (ValueError, TypeError) as exc:
+            self._json(400, {"error": "Bad request: %s" % exc})
+            return
+        if not resume.strip() or not job.strip():
+            self._json(400, {"error": "Please provide both a job description and a resume."})
+            return
+        if not isinstance(skills, list):
+            skills = []
+        if not GROQ_API_KEY:
+            self._json(500, {"error":
+                "GROQ_API_KEY is not set. Set it in your terminal and restart. "
+                "See the setup notes at the top of resume_adapter.py."})
+            return
+        try:
+            result = call_groq(resume, job, skills)
             self._json(200, {"result": result})
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:800]
@@ -158,6 +290,12 @@ PAGE = r"""<!DOCTYPE html>
   .banner.warn { background:rgba(246,185,59,.12); border:1px solid var(--warn); color:var(--warn); }
   .banner.ok   { background:rgba(74,222,128,.10); border:1px solid var(--ok); color:var(--ok); }
   .banner.bad  { background:rgba(255,107,107,.10); border:1px solid var(--bad); color:var(--bad); }
+  .skill-row { display:flex; gap:10px; align-items:center; justify-content:space-between;
+               background:#0c0f13; border:1px solid var(--line); border-radius:8px;
+               padding:8px 10px; margin-top:8px; }
+  .skill-row .name { font-size:13px; word-break:break-word; }
+  .skill-row select { background:#0c0f13; color:var(--ink); border:1px solid var(--line);
+                      border-radius:6px; padding:5px 6px; font-size:12px; min-width:190px; }
   kbd { background:#0c0f13; border:1px solid var(--line); border-radius:4px; padding:0 5px; font-size:11px; }
 </style>
 </head>
@@ -165,13 +303,20 @@ PAGE = r"""<!DOCTYPE html>
 <header>
   <h1>Resume Adapter &mdash; runs locally</h1>
   <p>Sensitive text you redact is replaced <b>in your browser</b> before anything is sent.
-     Only the redacted resume + the job text reach Groq. Originals are restored locally.</p>
+     Only the redacted resume, the job text, and your skill ratings reach Groq. Originals are restored locally.</p>
 </header>
 
 <div class="wrap">
   <div class="panel">
     <h2>1 &middot; Job description (paste text)</h2>
     <textarea id="job" placeholder="Paste the job posting text here. (Pasting text is far more reliable than scraping a link live.)"></textarea>
+    <div class="row">
+      <button id="skillsBtn" class="ghost">Find required skills &amp; rate yourself</button>
+    </div>
+    <div class="note">Optional but recommended: pull the skills this job asks for, then rate your
+      <b>real</b> experience with each. Your honest ratings steer what gets emphasised and what lands in the gap list.
+      Leave a skill on &ldquo;Skip&rdquo; to keep it out entirely.</div>
+    <div id="skillsList"></div>
   </div>
 
   <div class="panel">
@@ -188,10 +333,11 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 
   <div class="panel">
-    <h2>3 &middot; Exactly what will be sent to Groq</h2>
+    <h2>3 &middot; What leaves your browser (ratings + redacted resume)</h2>
     <div class="sent" id="preview">(redact something to see the outgoing text)</div>
+    <div class="note">The job description text is also sent, alongside what you see above.</div>
     <div class="row">
-      <button id="goBtn">Tailor my resume</button>
+      <button id="goBtn">Tailor swift my resume</button>
     </div>
     <div class="banner warn" id="warnBanner"></div>
     <div class="banner bad" id="errBanner"></div>
@@ -212,10 +358,60 @@ const $ = id => document.getElementById(id);
 let map = {};
 let counter = 0;
 
+const LEVELS = [
+  "Skip - leave this out",
+  "No hands-on experience",
+  "Basic - some familiarity",
+  "Working knowledge",
+  "Experienced / advanced"
+];
+const SKIP = LEVELS[0];
+
 function nextPh() { counter += 1; return "[[RID_" + counter + "]]"; }
 
+function collectSkills() {
+  return [...document.querySelectorAll(".skill-row")].map(r => ({
+    skill: r.dataset.skill,
+    level: r.querySelector("select").value
+  }));
+}
+
+function assessmentText() {
+  const s = collectSkills().filter(x => x.level && x.level !== SKIP);
+  if (!s.length) return "";
+  return "CANDIDATE SELF-ASSESSMENT:\n" +
+    s.map(x => "- " + x.skill + ": " + x.level).join("\n");
+}
+
 function refreshPreview() {
-  $("preview").textContent = $("resume").value || "(empty)";
+  const resume = $("resume").value || "(empty)";
+  const a = assessmentText();
+  $("preview").textContent = a ? (a + "\n\n---\n\n" + resume) : resume;
+}
+
+function renderSkills(skills) {
+  const box = $("skillsList");
+  box.innerHTML = "";
+  skills.forEach(name => {
+    const row = document.createElement("div");
+    row.className = "skill-row";
+    row.dataset.skill = name;
+    const label = document.createElement("span");
+    label.className = "name";
+    label.textContent = name;
+    const sel = document.createElement("select");
+    LEVELS.forEach(lv => {
+      const o = document.createElement("option");
+      o.value = lv; o.textContent = lv;
+      sel.appendChild(o);
+    });
+    sel.value = SKIP;
+    sel.onchange = refreshPreview;
+    row.appendChild(label);
+    row.appendChild(sel);
+    box.appendChild(row);
+  });
+  refreshPreview();
 }
 
 function refreshChips() {
@@ -234,6 +430,29 @@ function refreshChips() {
     el.appendChild(x); c.appendChild(el);
   });
 }
+
+$("skillsBtn").onclick = async () => {
+  hide("warnBanner"); hide("errBanner");
+  const job = $("job").value.trim();
+  if (!job) { flash("errBanner","Paste the job description first."); return; }
+  $("skillsBtn").disabled = true; $("skillsBtn").textContent = "Finding...";
+  try {
+    const res = await fetch("/api/skills", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job })
+    });
+    const data = await res.json();
+    if (!res.ok) { flash("errBanner", data.error || ("Error " + res.status)); return; }
+    const skills = data.skills || [];
+    renderSkills(skills);
+    if (!skills.length) flash("warnBanner","No skills were detected. You can still tailor without ratings.");
+  } catch (err) {
+    flash("errBanner","Network/local-server error: " + err.message);
+  } finally {
+    $("skillsBtn").disabled = false; $("skillsBtn").textContent = "Find required skills & rate yourself";
+  }
+};
 
 $("redactBtn").onclick = () => {
   const ta = $("resume");
@@ -285,12 +504,13 @@ $("goBtn").onclick = async () => {
   const job = $("job").value.trim();
   const resume = $("resume").value.trim();
   if (!job || !resume) { flash("errBanner","Fill in both the job description and the resume."); return; }
+  const skills = collectSkills().filter(x => x.level && x.level !== SKIP);
   $("goBtn").disabled = true; $("goBtn").textContent = "Contacting Groq...";
   try {
     const res = await fetch("/api/rewrite", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job, resume })
+      body: JSON.stringify({ job, resume, skills })
     });
     const data = await res.json();
     if (!res.ok) { flash("errBanner", data.error || ("Error " + res.status)); return; }
