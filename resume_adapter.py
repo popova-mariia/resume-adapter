@@ -20,14 +20,34 @@ SYSTEM_PROMPT = (
     "PLACEHOLDER RULE (critical): Treat every [[RID_n]] token as an opaque, fixed "
     "string. Reproduce each one EXACTLY where it appears. Never modify, translate, "
     "remove, merge, or invent placeholder tokens.\n\n"
-    "YOUR TASK: Rewrite the resume (or its most relevant sections) so the "
-    "candidate's genuine, existing experience is expressed using the terminology "
-    "and keywords found in the job description, to improve relevance and keyword "
-    "match for applicant tracking systems.\n\n"
+    "YOUR TASK: Propose targeted edits so the candidate's genuine, existing "
+    "experience is expressed using the terminology and keywords found in the job "
+    "description. Do NOT output a full rewritten resume. Return a list of focused "
+    "before/after changes the candidate will apply by hand.\n\n"
+    "OUTPUT FORMAT (critical): Return ONLY a JSON object of exactly this form, "
+    "with no commentary, markdown fences, or text outside the JSON:\n"
+    '{"changes": [{"section": "Experience - Acme Corp", '
+    '"original": "text copied verbatim from the resume", '
+    '"suggested": "the rewritten replacement", '
+    '"why": "one short sentence naming the JD keyword this targets"}], '
+    '"gaps": ["requirement the job wants but the candidate lacks"]}\n\n'
+    "RULES FOR EACH CHANGE:\n"
+    "- \"original\" MUST be copied character-for-character from the resume "
+    "(including any [[RID_n]] tokens, punctuation, and casing) so it can be "
+    "located automatically. Never paraphrase or trim it.\n"
+    "- Keep each change small and focused: one bullet point, one sentence, or one "
+    "short block. Never more than about 3 lines of the resume per change.\n"
+    "- \"suggested\" is the full replacement for that excerpt, keeping every "
+    "[[RID_n]] token the excerpt contained.\n"
+    "- \"section\" is a short human label for where the excerpt sits (e.g. "
+    "'Summary', 'Experience - most recent role', 'Skills').\n"
+    "- Propose the 5-15 highest-impact changes; skip parts that need no change.\n"
+    "- \"gaps\" lists requirements from the job the candidate does not meet; use "
+    "[] if there are none.\n\n"
     "USING THE CANDIDATE SELF-ASSESSMENT (if present): It lists skills the job asks "
     "for, each with the candidate's own rating of their experience. Treat each "
     "rating as a truthful first-person statement by the candidate, and let it guide "
-    "emphasis and the gap list:\n"
+    "emphasis and the gaps list:\n"
     "- 'Experienced / advanced' or 'Working knowledge': you may surface and "
     "emphasize this skill using the job's terminology, even if the resume mentions "
     "it only briefly.\n"
@@ -35,8 +55,8 @@ SYSTEM_PROMPT = (
     "'exposure to'), never as a core strength.\n"
     "- 'No hands-on experience' (or a skill the candidate omitted from the "
     "assessment): do NOT present it as a strength. If the job requires it, put it "
-    "under 'Gaps to consider'.\n"
-    "- The self-assessment adjusts emphasis and the gap list only. It never "
+    "in \"gaps\".\n"
+    "- The self-assessment adjusts emphasis and the gaps list only. It never "
     "licenses inventing specific projects, employers, dates, tools, certifications, "
     "or metrics. Describe every skill only in the general terms the candidate's own "
     "materials and ratings support.\n\n"
@@ -44,13 +64,11 @@ SYSTEM_PROMPT = (
     "- Do NOT invent skills, tools, employers, dates, certifications, degrees, or "
     "achievements that neither the resume nor the self-assessment supports. Only "
     "rephrase and surface what is genuinely present or genuinely claimed.\n"
-    "- If the job wants something the candidate lacks, do not fabricate it. Note "
-    "it in a short separate 'Gaps to consider' section at the very end so the "
-    "candidate can address it honestly.\n"
-    "- Keep all [[RID_n]] placeholders verbatim.\n"
-    "- Keep the tone professional and the content truthful.\n\n"
-    "Output the tailored resume text, followed by the optional 'Gaps to consider' "
-    "section. Do not add commentary before or after."
+    "- If the job wants something the candidate lacks, do not fabricate it; put it "
+    "in \"gaps\" so the candidate can address it honestly.\n"
+    "- Keep all [[RID_n]] placeholders verbatim in both \"original\" and "
+    "\"suggested\".\n"
+    "- Keep the tone professional and the content truthful."
 )
 
 SKILLS_SYSTEM_PROMPT = (
@@ -129,6 +147,42 @@ def extract_json(text):
             except ValueError:
                 continue
     return None
+
+
+def parse_changes(raw):
+    """Turn the model's raw reply into ({changes, gaps}) or None on failure."""
+    parsed = extract_json(raw)
+    if not isinstance(parsed, dict):
+        return None
+    raw_changes = parsed.get("changes")
+    if not isinstance(raw_changes, list):
+        return None
+    changes = []
+    for ch in raw_changes:
+        if not isinstance(ch, dict):
+            continue
+        original = ch.get("original")
+        suggested = ch.get("suggested")
+        if not isinstance(original, str) or not isinstance(suggested, str):
+            continue
+        original, suggested = original.strip("\n"), suggested.strip("\n")
+        if not original.strip() or not suggested.strip():
+            continue
+        if original.strip() == suggested.strip():
+            continue
+        changes.append({
+            "section": str(ch.get("section") or "").strip(),
+            "original": original,
+            "suggested": suggested,
+            "why": str(ch.get("why") or "").strip(),
+        })
+    gaps_raw = parsed.get("gaps")
+    gaps = []
+    if isinstance(gaps_raw, list):
+        gaps = [g.strip() for g in gaps_raw if isinstance(g, str) and g.strip()]
+    if not changes and not gaps:
+        return None
+    return {"changes": changes, "gaps": gaps}
 
 
 def extract_skills(job_text):
@@ -232,8 +286,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "See the setup notes at the top of resume_adapter.py."})
             return
         try:
-            result = call_groq(resume, job, skills)
-            self._json(200, {"result": result})
+            raw = call_groq(resume, job, skills)
+            structured = parse_changes(raw)
+            if structured is None:
+                # Model ignored the JSON format; let the UI show the raw text.
+                self._json(200, {"raw": raw})
+            else:
+                self._json(200, structured)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:800]
             self._json(502, {"error": "Groq returned HTTP %s. %s" % (exc.code, detail)})
@@ -297,6 +356,45 @@ PAGE = r"""<!DOCTYPE html>
   .skill-row select { background:#0c0f13; color:var(--ink); border:1px solid var(--line);
                       border-radius:6px; padding:5px 6px; font-size:12px; min-width:190px; }
   kbd { background:#0c0f13; border:1px solid var(--line); border-radius:4px; padding:0 5px; font-size:11px; }
+
+  /* --- suggestion diff cards --- */
+  .change { background:#0c0f13; border:1px solid var(--line); border-radius:10px;
+            padding:12px; margin-top:10px; }
+  .chead { display:flex; justify-content:space-between; align-items:center;
+           gap:10px; flex-wrap:wrap; margin-bottom:4px; }
+  .csec { font-size:12px; color:var(--accent); text-transform:uppercase;
+          letter-spacing:.04em; font-weight:600; }
+  .dlabel { font-size:11px; color:var(--mut); margin:8px 0 3px;
+            text-transform:uppercase; letter-spacing:.06em; }
+  .dblock { white-space:pre-wrap; word-break:break-word;
+            font:13px/1.65 ui-monospace,Menlo,Consolas,monospace;
+            border:1px solid var(--line); border-radius:8px; padding:9px 10px; }
+  .dblock.old { border-left:3px solid var(--bad); color:var(--mut); }
+  .dblock.new { border-left:3px solid var(--ok); }
+  .dblock .rm  { background:rgba(255,107,107,.22); color:var(--ink);
+                 text-decoration:line-through; border-radius:3px; padding:0 2px; }
+  .dblock .add { background:rgba(74,222,128,.18); border-radius:3px; padding:0 2px; }
+  .cwhy { font-size:12px; color:var(--mut); margin-top:8px; }
+  .cnote { font-size:12px; color:var(--warn); margin-top:8px; }
+  .gaps { margin-top:14px; border-top:1px dashed var(--line); padding-top:10px; }
+  .gaps h3 { margin:0 0 6px; font-size:12px; color:var(--warn);
+             text-transform:uppercase; letter-spacing:.04em; }
+  .gaps ul { margin:0; padding-left:18px; font-size:13px; color:var(--mut); }
+  .empty { color:var(--mut); font-size:13px; padding:8px 0; }
+  details.fullver { margin-top:14px; border:1px solid var(--line);
+                    border-radius:10px; background:#0c0f13; }
+  details.fullver summary { cursor:pointer; padding:10px 12px; font-size:13px;
+                            font-weight:600; color:var(--accent);
+                            list-style:none; user-select:none; }
+  details.fullver summary::before { content:"\25b8"; display:inline-block;
+                                    margin-right:8px; transition:transform .15s; }
+  details.fullver[open] summary::before { transform:rotate(90deg); }
+  details.fullver summary::-webkit-details-marker { display:none; }
+  details.fullver .fbody { padding:0 12px 12px; }
+  details.fullver .ftext { white-space:pre-wrap; word-break:break-word;
+                           font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;
+                           border:1px solid var(--line); border-radius:8px;
+                           padding:10px; max-height:420px; overflow:auto; }
 </style>
 </head>
 <body>
@@ -337,18 +435,18 @@ PAGE = r"""<!DOCTYPE html>
     <div class="sent" id="preview">(redact something to see the outgoing text)</div>
     <div class="note">The job description text is also sent, alongside what you see above.</div>
     <div class="row">
-      <button id="goBtn">Tailor swift my resume</button>
+      <button id="goBtn">Suggest edits</button>
     </div>
     <div class="banner warn" id="warnBanner"></div>
     <div class="banner bad" id="errBanner"></div>
   </div>
 
   <div class="panel">
-    <h2>4 &middot; Tailored resume (originals restored)</h2>
+    <h2>4 &middot; Suggested edits (originals restored)</h2>
     <div class="banner ok" id="okBanner"></div>
-    <div class="result" id="result">(result appears here)</div>
+    <div id="result"><div class="empty">(suggestions appear here as before/after cards; copy each new version and paste it into your CV yourself)</div></div>
     <div class="row">
-      <button id="copyBtn" class="ghost">Copy</button>
+      <button id="copyBtn" class="ghost">Copy all new versions</button>
     </div>
   </div>
 </div>
@@ -357,6 +455,7 @@ PAGE = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let map = {};
 let counter = 0;
+let allSuggestions = [];   // restored "new" texts, for the copy-all button
 
 const LEVELS = [
   "Skip - leave this out",
@@ -366,6 +465,8 @@ const LEVELS = [
   "Experienced / advanced"
 ];
 const SKIP = LEVELS[0];
+const PH_RE = /\[\[RID_\d+\]\]/g;
+const DIFF_WORD_LIMIT = 600;   // skip inline highlighting for huge excerpts
 
 function nextPh() { counter += 1; return "[[RID_" + counter + "]]"; }
 
@@ -499,6 +600,239 @@ function flash(id, msg) {
 }
 function hide(id){ $(id).style.display = "none"; }
 
+/* ---------- restoring placeholders locally ---------- */
+
+function restore(text) {
+  let out = text || "";
+  Object.entries(map).forEach(([ph, orig]) => { out = out.split(ph).join(orig); });
+  return out;
+}
+
+/* ---------- word-level diff (LCS) for highlighting ---------- */
+
+function esc(s) {
+  return (s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function wordDiff(a, b) {
+  const A = a.split(/\s+/).filter(Boolean);
+  const B = b.split(/\s+/).filter(Boolean);
+  const n = A.length, m = B.length;
+  if (n + m > DIFF_WORD_LIMIT) {
+    // too big to diff cheaply: mark nothing
+    return {
+      oldParts: A.map(t => ({ t, changed: false })),
+      newParts: B.map(t => ({ t, changed: false }))
+    };
+  }
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = A[i] === B[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
+  const oldParts = [], newParts = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (A[i] === B[j]) {
+      oldParts.push({ t: A[i], changed: false });
+      newParts.push({ t: B[j], changed: false });
+      i++; j++;
+    } else if (dp[i+1][j] >= dp[i][j+1]) {
+      oldParts.push({ t: A[i], changed: true }); i++;
+    } else {
+      newParts.push({ t: B[j], changed: true }); j++;
+    }
+  }
+  while (i < n) oldParts.push({ t: A[i++], changed: true });
+  while (j < m) newParts.push({ t: B[j++], changed: true });
+  return { oldParts, newParts };
+}
+
+function partsToHtml(parts, cls) {
+  return parts.map(p =>
+    p.changed ? '<span class="' + cls + '">' + esc(p.t) + '</span>' : esc(p.t)
+  ).join(" ");
+}
+
+/* ---------- rendering the suggestion cards ---------- */
+
+function copyButton(text, label) {
+  const btn = document.createElement("button");
+  btn.textContent = label || "Copy new text";
+  btn.onclick = () => {
+    navigator.clipboard.writeText(text);
+    const prev = btn.textContent;
+    btn.textContent = "Copied \u2713";
+    setTimeout(() => { btn.textContent = prev; }, 1500);
+  };
+  return btn;
+}
+
+function renderOutput(data) {
+  const box = $("result");
+  box.innerHTML = "";
+  allSuggestions = [];
+
+  // Fallback: model ignored the JSON format, show restored raw text.
+  if (data.raw !== undefined) {
+    const missing = Object.keys(map).filter(ph => !(data.raw || "").includes(ph));
+    if (missing.length) {
+      flash("warnBanner",
+        "Heads up: the model did not return " + missing.length +
+        " placeholder(s), so these may be missing from the text: " +
+        missing.map(ph => map[ph]).join(", "));
+    }
+    flash("warnBanner",
+      "The model didn't return structured edits this time, so here's its raw reply. Try again for before/after cards.");
+    const div = document.createElement("div");
+    div.className = "result";
+    div.textContent = restore(data.raw);
+    box.appendChild(div);
+    allSuggestions = [restore(data.raw)];
+    return;
+  }
+
+  const changes = data.changes || [];
+  const gaps = data.gaps || [];
+  const resumeNow = $("resume").value;
+
+  if (!changes.length) {
+    const div = document.createElement("div");
+    div.className = "empty";
+    div.textContent = "No changes were suggested.";
+    box.appendChild(div);
+  }
+
+  changes.forEach((ch, idx) => {
+    const oldRestored = restore(ch.original);
+    const newRestored = restore(ch.suggested);
+    allSuggestions.push({
+      section: ch.section || ("Change " + (idx + 1)),
+      oldText: oldRestored,
+      newText: newRestored
+    });
+
+    const card = document.createElement("div");
+    card.className = "change";
+
+    const head = document.createElement("div");
+    head.className = "chead";
+    const sec = document.createElement("span");
+    sec.className = "csec";
+    sec.textContent = ch.section || ("Change " + (idx + 1));
+    head.appendChild(sec);
+    head.appendChild(copyButton(newRestored));
+    card.appendChild(head);
+
+    const diff = wordDiff(oldRestored, newRestored);
+
+    const lo = document.createElement("div");
+    lo.className = "dlabel"; lo.textContent = "Current";
+    card.appendChild(lo);
+    const ob = document.createElement("div");
+    ob.className = "dblock old";
+    ob.innerHTML = partsToHtml(diff.oldParts, "rm");
+    card.appendChild(ob);
+
+    const ln = document.createElement("div");
+    ln.className = "dlabel"; ln.textContent = "Suggested";
+    card.appendChild(ln);
+    const nb = document.createElement("div");
+    nb.className = "dblock new";
+    nb.innerHTML = partsToHtml(diff.newParts, "add");
+    card.appendChild(nb);
+
+    if (ch.why) {
+      const why = document.createElement("div");
+      why.className = "cwhy";
+      why.textContent = "Why: " + ch.why;
+      card.appendChild(why);
+    }
+
+    const notes = [];
+    if (!resumeNow.includes(ch.original)) {
+      notes.push("Couldn't find the \u201ccurrent\u201d text verbatim in your resume box \u2014 the model may have paraphrased it. Double-check before replacing.");
+    }
+    const dropped = (ch.original.match(PH_RE) || []).filter(ph => !ch.suggested.includes(ph));
+    if (dropped.length) {
+      notes.push("This suggestion dropped redacted detail(s): " +
+        dropped.map(ph => map[ph] || ph).join(", ") + ". Add them back by hand if you use it.");
+    }
+    notes.forEach(msg => {
+      const n = document.createElement("div");
+      n.className = "cnote";
+      n.textContent = "\u26a0 " + msg;
+      card.appendChild(n);
+    });
+
+    box.appendChild(card);
+  });
+
+  // ----- complete tailored version (all locatable edits applied) -----
+  if (changes.length) {
+    let full = resumeNow;
+    const unapplied = [];
+    changes.forEach((ch, idx) => {
+      const at = full.indexOf(ch.original);
+      if (at === -1) {
+        unapplied.push(ch.section || ("Change " + (idx + 1)));
+        return;
+      }
+      full = full.slice(0, at) + ch.suggested + full.slice(at + ch.original.length);
+    });
+    const fullRestored = restore(full);
+
+    const det = document.createElement("details");
+    det.className = "fullver";
+    const sum = document.createElement("summary");
+    sum.textContent = "Complete tailored resume (all edits applied)";
+    det.appendChild(sum);
+
+    const body = document.createElement("div");
+    body.className = "fbody";
+    if (unapplied.length) {
+      const n = document.createElement("div");
+      n.className = "cnote";
+      n.style.marginBottom = "8px";
+      n.textContent = "\u26a0 " + unapplied.length +
+        " edit(s) couldn't be applied automatically (their \u201ccurrent\u201d text wasn't found verbatim): " +
+        unapplied.join(", ") + ". Apply those by hand from the cards above.";
+      body.appendChild(n);
+    }
+    const txt = document.createElement("div");
+    txt.className = "ftext";
+    txt.textContent = fullRestored;
+    body.appendChild(txt);
+    const row = document.createElement("div");
+    row.className = "row";
+    row.appendChild(copyButton(fullRestored, "Copy complete version"));
+    body.appendChild(row);
+    det.appendChild(body);
+    box.appendChild(det);
+  }
+
+  if (gaps.length) {
+    const g = document.createElement("div");
+    g.className = "gaps";
+    const h = document.createElement("h3");
+    h.textContent = "Gaps to consider";
+    g.appendChild(h);
+    const ul = document.createElement("ul");
+    gaps.forEach(gap => {
+      const li = document.createElement("li");
+      li.textContent = gap;
+      ul.appendChild(li);
+    });
+    g.appendChild(ul);
+    box.appendChild(g);
+  }
+
+  if (changes.length) {
+    $("okBanner").textContent = changes.length +
+      " suggestion(s) ready. Redactions were restored locally \u2014 nothing sensitive left your browser.";
+    $("okBanner").style.display = "block";
+  }
+}
+
 $("goBtn").onclick = async () => {
   hide("warnBanner"); hide("errBanner"); hide("okBanner");
   const job = $("job").value.trim();
@@ -514,32 +848,26 @@ $("goBtn").onclick = async () => {
     });
     const data = await res.json();
     if (!res.ok) { flash("errBanner", data.error || ("Error " + res.status)); return; }
-
-    let out = data.result || "";
-    const missing = Object.keys(map).filter(ph => !out.includes(ph));
-    if (missing.length) {
-      const lostItems = missing.map(ph => map[ph]).join(", ");
-      flash("warnBanner",
-        "Heads up: the model did not return " + missing.length +
-        " placeholder(s), so these were NOT auto-restored and may be lost from the "
-        + "rewrite: " + lostItems + ". Check the output and add them back by hand.");
-    } else {
-      $("okBanner").textContent = "All " + Object.keys(map).length +
-        " redaction(s) verified and restored locally.";
-      $("okBanner").style.display = "block";
-    }
-    Object.entries(map).forEach(([ph, orig]) => { out = out.split(ph).join(orig); });
-    $("result").textContent = out;
+    renderOutput(data);
   } catch (err) {
     flash("errBanner", "Network/local-server error: " + err.message);
   } finally {
-    $("goBtn").disabled = false; $("goBtn").textContent = "Tailor my resume";
+    $("goBtn").disabled = false; $("goBtn").textContent = "Suggest edits";
   }
 };
 
 $("copyBtn").onclick = () => {
-  navigator.clipboard.writeText($("result").textContent || "");
-  flash("okBanner","Copied.");
+  if (!allSuggestions.length) { flash("warnBanner","Nothing to copy yet."); return; }
+  let text;
+  if (typeof allSuggestions[0] === "string") {
+    text = allSuggestions[0];
+  } else {
+    text = allSuggestions.map(s =>
+      "## " + s.section + "\nOLD: " + s.oldText + "\nNEW: " + s.newText
+    ).join("\n\n");
+  }
+  navigator.clipboard.writeText(text);
+  flash("okBanner","Copied all suggestions.");
 };
 </script>
 </body>
