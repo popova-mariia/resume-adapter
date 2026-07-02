@@ -783,7 +783,8 @@ $("fetchBtn").onclick = async () => {
   const url = $("jobUrl").value.trim();
   if (!url) { flash("errBanner","Paste a link to the job posting first."); return; }
   if ($("job").value.trim() &&
-      !(await askConfirm("Fetching will replace the text currently in the job description box. This can't be undone."))) {
+      !(await askConfirm("Fetching will replace the text currently in the job description box. This can't be undone.",
+                         "Replace job description?", "Replace text"))) {
     return;
   }
   $("fetchBtn").disabled = true; $("fetchBtn").textContent = "Fetching & cleaning...";
@@ -892,12 +893,14 @@ function flash(id, msg, ms) {
 }
 function hide(id){ $(id).style.display = "none"; }
 
-/* Promise-based replacement for confirm(): resolves true (Replace) / false
-   (Cancel, Escape, or backdrop click). */
-function askConfirm(msg) {
+/* Promise-based replacement for confirm(): resolves true (OK button) / false
+   (Cancel, Escape, or backdrop click). title and okLabel are optional. */
+function askConfirm(msg, title, okLabel) {
   return new Promise(resolve => {
     const back = $("modalBack");
+    $("modalTitle").textContent = title || "Are you sure?";
     $("modalMsg").textContent = msg;
+    $("modalOk").textContent = okLabel || "Continue";
     const done = val => {
       back.classList.remove("open");
       document.removeEventListener("keydown", onKey);
@@ -1152,6 +1155,17 @@ $("goBtn").onclick = async () => {
   const job = $("job").value.trim();
   const resume = $("resume").value.trim();
   if (!job || !resume) { flash("errBanner","Fill in both the job description and the resume."); return; }
+  const nRed = Object.keys(map).length;
+  const privacyMsg = nRed
+    ? "Your resume (with " + nRed + " redaction" + (nRed === 1 ? "" : "s") +
+      " applied), the job description, and your skill ratings are about to be sent to Groq. " +
+      "Are you sure the remaining text contains no sensitive info you'd rather redact first? " +
+      "Panel 3 shows exactly what will leave your browser."
+    : "You haven't redacted anything. Your FULL resume, the job description, and your skill " +
+      "ratings are about to be sent to Groq. Are you sure it contains no sensitive info " +
+      "(name, email, phone, address)? You can select text in the resume box and click " +
+      "\u201cRedact selected text\u201d first \u2014 panel 3 shows exactly what will leave your browser.";
+  if (!(await askConfirm(privacyMsg, "Send to Groq?", "Send to Groq"))) return;
   const skills = collectSkills().filter(x => x.level && x.level !== SKIP);
   $("goBtn").disabled = true; $("goBtn").textContent = "Contacting Groq...";
   try {
