@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
+import gzip
 import http.server
 import socketserver
 import json
 import os
 import urllib.request
 import urllib.error
+from html.parser import HTMLParser
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -78,6 +80,26 @@ SKILLS_SYSTEM_PROMPT = (
     "Rules: each item is a short label of 1-4 words, not a full sentence; include "
     "the 8-15 most important; no duplicates; no explanations or text outside the "
     "JSON."
+)
+
+CLEAN_SYSTEM_PROMPT = (
+    "You receive the raw visible text scraped from a careers or job-board web "
+    "page. It may contain navigation menus, headers, footers, cookie and legal "
+    "notices, sign-in prompts, 'related jobs' lists, ads, and other clutter mixed "
+    "in with one job posting.\n\n"
+    "YOUR TASK: Return ONLY the text of the job posting itself: the job title, "
+    "company name, location, and the body of the posting (about the role, "
+    "responsibilities, requirements, qualifications, benefits, how to apply), "
+    "in the order it appears in the input.\n\n"
+    "STRICT RULES:\n"
+    "- Copy the posting text as-is. Do NOT summarize, rewrite, reorder, "
+    "translate, or add anything that is not in the input.\n"
+    "- Drop everything that is not part of this one posting: menus, sign-in "
+    "prompts, cookie banners, footers, ads, share buttons, lists of other jobs.\n"
+    "- Output plain text only: no markdown fences, no commentary, no headings "
+    "you invented.\n"
+    "- If the input does not contain an actual job posting, output exactly: "
+    "NO_JOB_POSTING_FOUND"
 )
 
 
@@ -213,6 +235,159 @@ def extract_skills(job_text):
     return skills[:15]
 
 
+# ---------- fetching a job posting from a URL (best-effort) ----------
+
+MAX_FETCH_BYTES = 3_000_000      # don't slurp more than ~3 MB of HTML
+MAX_JOB_CHARS = 20_000           # cap the text we hand back to the UI
+
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "*/*;q=0.8"),
+    "Accept-Language": "en;q=0.9",
+    "Accept-Encoding": "gzip, identity",
+}
+
+
+class _TextExtractor(HTMLParser):
+    """Very small HTML -> visible-text converter (no third-party deps)."""
+
+    SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "head",
+                 "iframe", "nav", "form", "button"}
+    BLOCK_TAGS = {"p", "div", "section", "article", "header", "footer",
+                  "main", "aside", "li", "ul", "ol", "table", "tr", "td",
+                  "th", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
+                  "blockquote", "pre", "dt", "dd"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP_TAGS:
+            self._skip_depth += 1
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP_TAGS:
+            if self._skip_depth:
+                self._skip_depth -= 1
+        elif tag in self.BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self.parts.append(data)
+
+
+def html_to_text(html_text):
+    parser = _TextExtractor()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:
+        pass  # keep whatever was extracted before the parser choked
+    text = "".join(parser.parts)
+    lines = [" ".join(ln.split()) for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+
+def fetch_job_page(url):
+    """Fetch a URL and return the page's visible text. Raises ValueError with a
+    user-facing message when the page can't be fetched or yields no usable text."""
+    url = (url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("The link must start with http:// or https://.")
+    req = urllib.request.Request(url)
+    for key, val in BROWSER_HEADERS.items():
+        req.add_header(key, val)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read(MAX_FETCH_BYTES)
+            encoding = (resp.headers.get("Content-Encoding") or "").lower()
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            final_url = resp.geturl().lower()  # where we landed after redirects
+    except urllib.error.HTTPError as exc:
+        raise ValueError(
+            "The site answered with HTTP %s. Many job boards block automated "
+            "fetches - please copy the posting text and paste it instead." % exc.code)
+    except Exception as exc:
+        raise ValueError(
+            "Couldn't reach that link (%s). Check the URL, or copy the posting "
+            "text and paste it instead." % exc)
+    if "gzip" in encoding:
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            pass
+    if ctype and ("html" not in ctype and "text" not in ctype):
+        raise ValueError(
+            "That link isn't an HTML page (server says '%s'). Please paste the "
+            "posting text instead." % ctype.split(";")[0])
+    charset = "utf-8"
+    if "charset=" in ctype:
+        charset = ctype.split("charset=")[-1].split(";")[0].strip() or "utf-8"
+    try:
+        html_text = raw.decode(charset, "replace")
+    except LookupError:
+        html_text = raw.decode("utf-8", "replace")
+    text = html_to_text(html_text)
+    # Detect login walls (e.g. LinkedIn's authwall): signal 1 is the URL we were
+    # redirected to; signal 2 is a fallback requiring >=2 login-page phrases in
+    # the text, so a job page that merely mentions "sign in" once isn't rejected.
+    wall = any(k in final_url for k in ("authwall", "login", "signin", "checkpoint"))
+    if not wall:
+        markers = ("sign in", "join now", "forgot password", "keep me signed in")
+        wall = sum(1 for m in markers if m in text.lower()) >= 2
+    if wall:
+        raise ValueError(
+            "The site returned a login page instead of the posting (LinkedIn and "
+            "similar boards require sign-in). Please copy the posting text and "
+            "paste it instead.")
+    if len(text) < 200:
+        raise ValueError(
+            "The page returned almost no readable text - it's probably rendered "
+            "with JavaScript or behind a login (common on LinkedIn, Workday, "
+            "etc.). Please copy the posting text and paste it instead.")
+    if len(text) > MAX_JOB_CHARS:
+        text = text[:MAX_JOB_CHARS] + "\n\n[... page text truncated ...]"
+    return text
+
+
+def clean_job_text(raw_text):
+    """Second-pass Groq call: strip scraped-page clutter (menus, footers, cookie
+    banners) so only the posting remains. Returns the cleaned text, or raises
+    ValueError when the reply is unusable; the caller falls back to raw_text."""
+    messages = [
+        {"role": "system", "content": CLEAN_SYSTEM_PROMPT},
+        {"role": "user", "content": "SCRAPED PAGE TEXT:\n" + raw_text},
+    ]
+    cleaned = (groq_chat(messages, temperature=0.0) or "").strip()
+    if cleaned.startswith("```"):          # tolerate accidental markdown fences
+        first_nl = cleaned.find("\n")
+        if first_nl != -1:
+            cleaned = cleaned[first_nl + 1:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+    if "NO_JOB_POSTING_FOUND" in cleaned[:80]:
+        raise ValueError("the model found no job posting in the page text")
+    if len(cleaned) < 200:
+        raise ValueError("the cleaned text came back suspiciously short")
+    if len(cleaned) > len(raw_text):
+        raise ValueError("the cleaned text grew - the model may have added "
+                         "content, so it can't be trusted")
+    return cleaned
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, code, ctype, body_bytes):
         self.send_response(code)
@@ -239,8 +414,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_skills()
         elif self.path == "/api/rewrite":
             self.handle_rewrite()
+        elif self.path == "/api/fetch_job":
+            self.handle_fetch_job()
         else:
             self._json(404, {"error": "not found"})
+
+    def handle_fetch_job(self):
+        try:
+            payload = self._read_body()
+            url = payload.get("url", "")
+        except (ValueError, TypeError) as exc:
+            self._json(400, {"error": "Bad request: %s" % exc})
+            return
+        if not (url or "").strip():
+            self._json(400, {"error": "Paste a link to the job posting first."})
+            return
+        try:
+            text = fetch_job_page(url)
+        except ValueError as exc:
+            self._json(422, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._json(502, {"error":
+                "Fetching failed: %s. Please paste the posting text instead." % exc})
+            return
+        # Second pass: ask Groq to strip menus/footers so the later skills and
+        # rewrite calls see only the posting. Any failure falls back to the raw
+        # scrape - this step must never make fetching worse.
+        if not GROQ_API_KEY:
+            self._json(200, {"text": text, "cleaned": False,
+                             "note": "GROQ_API_KEY not set, so no AI clean-up was done"})
+            return
+        try:
+            cleaned = clean_job_text(text)
+            self._json(200, {"text": cleaned, "cleaned": True,
+                             "raw_chars": len(text), "clean_chars": len(cleaned)})
+        except Exception as exc:
+            self._json(200, {"text": text, "cleaned": False,
+                             "note": "AI clean-up failed (%s)" % exc})
 
     def handle_skills(self):
         try:
@@ -327,6 +538,9 @@ PAGE = r"""<!DOCTYPE html>
              color:var(--ink); border:1px solid var(--line); border-radius:8px;
              padding:10px; font:13px/1.5 ui-monospace,Menlo,Consolas,monospace; }
   .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  input[type="url"] { flex:1 1 220px; min-width:0; background:#0c0f13; color:var(--ink);
+                      border:1px solid var(--line); border-radius:8px; padding:9px 10px;
+                      font:13px/1.5 ui-monospace,Menlo,Consolas,monospace; }
   button { background:var(--accent); color:#06101f; border:0; border-radius:8px;
            padding:9px 13px; font-weight:600; cursor:pointer; font-size:13px; }
   button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
@@ -395,6 +609,19 @@ PAGE = r"""<!DOCTYPE html>
                            font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;
                            border:1px solid var(--line); border-radius:8px;
                            padding:10px; max-height:420px; overflow:auto; }
+
+  /* --- confirm modal --- */
+  .modal-back { position:fixed; inset:0; display:none; align-items:center;
+                justify-content:center; background:rgba(5,8,12,.66);
+                backdrop-filter:blur(2px); z-index:50; }
+  .modal-back.open { display:flex; }
+  .modal { background:var(--panel); border:1px solid var(--line);
+           border-radius:12px; padding:18px;
+           width:min(440px, calc(100vw - 40px));
+           box-shadow:0 18px 50px rgba(0,0,0,.5); }
+  .modal h3 { margin:0 0 8px; font-size:15px; }
+  .modal p { margin:0 0 14px; color:var(--mut); font-size:13px; line-height:1.5; }
+  .modal .row { justify-content:flex-end; margin-top:0; }
 </style>
 </head>
 <body>
@@ -406,8 +633,16 @@ PAGE = r"""<!DOCTYPE html>
 
 <div class="wrap">
   <div class="panel">
-    <h2>1 &middot; Job description (paste text)</h2>
-    <textarea id="job" placeholder="Paste the job posting text here. (Pasting text is far more reliable than scraping a link live.)"></textarea>
+    <h2>1 &middot; Job description (paste text or fetch from a link)</h2>
+    <div class="row" style="margin-top:0; margin-bottom:8px;">
+      <input type="url" id="jobUrl" placeholder="https://... link to the job posting (optional)">
+      <button id="fetchBtn" class="ghost">Fetch from link</button>
+    </div>
+    <div class="note" style="margin-top:0; margin-bottom:8px;">Fetching from a link is best-effort:
+      many job boards (LinkedIn, Workday, sites that need login or JavaScript) will return an error
+      or junk. If that happens, just copy the posting text and paste it below &mdash; pasting always works.
+      Note: fetched page text is sent to Groq once for automatic clean-up (menus/footers stripped).</div>
+    <textarea id="job" placeholder="Paste the job posting text here, or use the link fetcher above."></textarea>
     <div class="row">
       <button id="skillsBtn" class="ghost">Find required skills &amp; rate yourself</button>
     </div>
@@ -447,6 +682,17 @@ PAGE = r"""<!DOCTYPE html>
     <div id="result"><div class="empty">(suggestions appear here as before/after cards; copy each new version and paste it into your CV yourself)</div></div>
     <div class="row">
       <button id="copyBtn" class="ghost">Copy all new versions</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-back" id="modalBack" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+  <div class="modal">
+    <h3 id="modalTitle">Replace job description?</h3>
+    <p id="modalMsg"></p>
+    <div class="row">
+      <button class="ghost" id="modalCancel">Cancel</button>
+      <button id="modalOk">Replace text</button>
     </div>
   </div>
 </div>
@@ -532,6 +778,52 @@ function refreshChips() {
   });
 }
 
+$("fetchBtn").onclick = async () => {
+  hide("warnBanner"); hide("errBanner");
+  const url = $("jobUrl").value.trim();
+  if (!url) { flash("errBanner","Paste a link to the job posting first."); return; }
+  if ($("job").value.trim() &&
+      !(await askConfirm("Fetching will replace the text currently in the job description box. This can't be undone."))) {
+    return;
+  }
+  $("fetchBtn").disabled = true; $("fetchBtn").textContent = "Fetching & cleaning...";
+  try {
+    const res = await fetch("/api/fetch_job", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      flash("errBanner", (data.error || ("Error " + res.status)) +
+        " Tip: paste the job text into the box instead.");
+      return;
+    }
+    $("job").value = data.text || "";
+    if (data.cleaned) {
+      const stripped = Math.max(0, (data.raw_chars || 0) - (data.clean_chars || 0));
+      flash("okBanner",
+        "Fetched " + (data.raw_chars || "?") + " characters and stripped ~" + stripped +
+        " characters of menus, footers and other page junk. Clean-up can occasionally drop parts " +
+        "of the posting \u2014 please skim the box against the original page.", 10000);
+    } else {
+      flash("warnBanner",
+        "Fetched " + ($("job").value.length) + " characters of raw page text" +
+        (data.note ? " (" + data.note + ")" : "") + ". Scraped pages often include " +
+        "menus/footers or miss parts of the posting \u2014 please skim the box and tidy it up before continuing.", 10000);
+    }
+  } catch (err) {
+    flash("errBanner","Network/local-server error: " + err.message +
+      " \u2014 paste the job text instead.");
+  } finally {
+    $("fetchBtn").disabled = false; $("fetchBtn").textContent = "Fetch from link";
+  }
+};
+
+$("jobUrl").addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); $("fetchBtn").click(); }
+});
+
 $("skillsBtn").onclick = async () => {
   hide("warnBanner"); hide("errBanner");
   const job = $("job").value.trim();
@@ -594,11 +886,33 @@ $("clearBtn").onclick = () => {
 
 $("resume").addEventListener("input", refreshPreview);
 
-function flash(id, msg) {
+function flash(id, msg, ms) {
   const b = $(id); b.textContent = msg; b.style.display = "block";
-  setTimeout(() => { b.style.display = "none"; }, 6000);
+  setTimeout(() => { b.style.display = "none"; }, ms || 6000);
 }
 function hide(id){ $(id).style.display = "none"; }
+
+/* Promise-based replacement for confirm(): resolves true (Replace) / false
+   (Cancel, Escape, or backdrop click). */
+function askConfirm(msg) {
+  return new Promise(resolve => {
+    const back = $("modalBack");
+    $("modalMsg").textContent = msg;
+    const done = val => {
+      back.classList.remove("open");
+      document.removeEventListener("keydown", onKey);
+      back.onclick = null;
+      resolve(val);
+    };
+    const onKey = e => { if (e.key === "Escape") done(false); };
+    $("modalOk").onclick = () => done(true);
+    $("modalCancel").onclick = () => done(false);
+    back.onclick = e => { if (e.target === back) done(false); };
+    document.addEventListener("keydown", onKey);
+    back.classList.add("open");
+    $("modalCancel").focus();
+  });
+}
 
 /* ---------- restoring placeholders locally ---------- */
 
