@@ -2,6 +2,14 @@
 
 Local, privacy-first demo for an Agentic AI workshop.
 
+## Try the deployed version
+
+You can test the hosted Render version here:
+
+https://resume-adapter-q3hg.onrender.com/
+
+The hosted version is useful for quick testing, but remember: text you enter is sent from your browser to the Render server, and then the redacted resume/job text is sent to Groq.
+
 ## What it does
 
 Paste a job description and your resume. Highlight or auto-detect sensitive information like your name, phone, or email. Those details are replaced with placeholder tokens locally in your browser before anything is sent. Only the redacted text is sent to Groq. When Groq replies, the original values are put back in locally.
@@ -16,7 +24,13 @@ Paste a job description and your resume. Highlight or auto-detect sensitive info
 ## Setup
 
 1. Get a free Groq API key at https://console.groq.com with no credit card.
-2. In a terminal, set your API key:
+2. Install requirements:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. In a terminal, set your API key:
 
    ```bash
    export GROQ_API_KEY="your_key_here"
@@ -30,13 +44,13 @@ Paste a job description and your resume. Highlight or auto-detect sensitive info
    $env:GROQ_API_KEY="your_key_here"
    ```
 
-3. Run the app:
+4. Run the app:
 
    ```bash
    python3 app.py
    ```
 
-4. Open http://127.0.0.1:8765 in your browser.
+5. Open http://127.0.0.1:8765 in your browser.
 
 ## Notes and things to verify
 
