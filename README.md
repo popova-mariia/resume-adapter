@@ -33,7 +33,7 @@ Paste a job description and your resume. Highlight or auto-detect sensitive info
 3. Run the app:
 
    ```bash
-   python3 resume_adapter.py
+   python3 app.py
    ```
 
 4. Open http://127.0.0.1:8765 in your browser.
