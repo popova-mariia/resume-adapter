@@ -1,519 +1,3 @@
-#!/usr/bin/env python3
-
-import gzip
-import http.server
-import socketserver
-import json
-import os
-import urllib.request
-import urllib.error
-from html.parser import HTMLParser
-
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-PORT = int(os.environ.get("PORT", "8765"))
-
-SYSTEM_PROMPT = (
-    "You are a resume-tailoring assistant. You receive a JOB DESCRIPTION and a "
-    "candidate's RESUME. Some sensitive details in the resume have been replaced "
-    "with placeholder tokens that look like [[RID_1]], [[RID_2]], and so on. You "
-    "may also receive a CANDIDATE SELF-ASSESSMENT.\n\n"
-    "PLACEHOLDER RULE (critical): Treat every [[RID_n]] token as an opaque, fixed "
-    "string. Reproduce each one EXACTLY where it appears. Never modify, translate, "
-    "remove, merge, or invent placeholder tokens.\n\n"
-    "YOUR TASK: Propose targeted edits so the candidate's genuine, existing "
-    "experience is expressed using the terminology and keywords found in the job "
-    "description. Do NOT output a full rewritten resume. Return a list of focused "
-    "before/after changes the candidate will apply by hand.\n\n"
-    "OUTPUT FORMAT (critical): Return ONLY a JSON object of exactly this form, "
-    "with no commentary, markdown fences, or text outside the JSON:\n"
-    '{"changes": [{"section": "Experience - Acme Corp", '
-    '"original": "text copied verbatim from the resume", '
-    '"suggested": "the rewritten replacement", '
-    '"why": "one short sentence naming the JD keyword this targets"}], '
-    '"gaps": ["requirement the job wants but the candidate lacks"]}\n\n'
-    "RULES FOR EACH CHANGE:\n"
-    "- \"original\" MUST be copied character-for-character from the resume "
-    "(including any [[RID_n]] tokens, punctuation, and casing) so it can be "
-    "located automatically. Never paraphrase or trim it.\n"
-    "- Keep each change small and focused: one bullet point, one sentence, or one "
-    "short block. Never more than about 3 lines of the resume per change.\n"
-    "- \"suggested\" is the full replacement for that excerpt, keeping every "
-    "[[RID_n]] token the excerpt contained.\n"
-    "- \"section\" is a short human label for where the excerpt sits (e.g. "
-    "'Summary', 'Experience - most recent role', 'Skills').\n"
-    "- Propose the 5-15 highest-impact changes; skip parts that need no change.\n"
-    "- \"gaps\" lists requirements from the job the candidate does not meet; use "
-    "[] if there are none.\n\n"
-    "USING THE CANDIDATE SELF-ASSESSMENT (if present): It lists skills the job asks "
-    "for, each with the candidate's own rating of their experience. Treat each "
-    "rating as a truthful first-person statement by the candidate, and let it guide "
-    "emphasis and the gaps list:\n"
-    "- 'Experienced / advanced' or 'Working knowledge': you may surface and "
-    "emphasize this skill using the job's terminology, even if the resume mentions "
-    "it only briefly.\n"
-    "- 'Basic - some familiarity': you may mention it modestly and honestly (e.g. "
-    "'exposure to'), never as a core strength.\n"
-    "- 'No hands-on experience' (or a skill the candidate omitted from the "
-    "assessment): do NOT present it as a strength. If the job requires it, put it "
-    "in \"gaps\".\n"
-    "- The self-assessment adjusts emphasis and the gaps list only. It never "
-    "licenses inventing specific projects, employers, dates, tools, certifications, "
-    "or metrics. Describe every skill only in the general terms the candidate's own "
-    "materials and ratings support.\n\n"
-    "INTEGRITY RULES (do not break):\n"
-    "- Do NOT invent skills, tools, employers, dates, certifications, degrees, or "
-    "achievements that neither the resume nor the self-assessment supports. Only "
-    "rephrase and surface what is genuinely present or genuinely claimed.\n"
-    "- If the job wants something the candidate lacks, do not fabricate it; put it "
-    "in \"gaps\" so the candidate can address it honestly.\n"
-    "- Keep all [[RID_n]] placeholders verbatim in both \"original\" and "
-    "\"suggested\".\n"
-    "- Keep the tone professional and the content truthful."
-)
-
-SKILLS_SYSTEM_PROMPT = (
-    "You extract the concrete skills, tools, technologies, and qualifications that "
-    "a job description asks for. Return ONLY a JSON object of exactly this form:\n"
-    '{"skills": ["Python", "AWS", "Stakeholder management"]}\n'
-    "Rules: each item is a short label of 1-4 words, not a full sentence; include "
-    "the 8-15 most important; no duplicates; no explanations or text outside the "
-    "JSON."
-)
-
-CLEAN_SYSTEM_PROMPT = (
-    "You receive the raw visible text scraped from a careers or job-board web "
-    "page. It may contain navigation menus, headers, footers, cookie and legal "
-    "notices, sign-in prompts, 'related jobs' lists, ads, and other clutter mixed "
-    "in with one job posting.\n\n"
-    "YOUR TASK: Return ONLY the text of the job posting itself: the job title, "
-    "company name, location, and the body of the posting (about the role, "
-    "responsibilities, requirements, qualifications, benefits, how to apply), "
-    "in the order it appears in the input.\n\n"
-    "STRICT RULES:\n"
-    "- Copy the posting text as-is. Do NOT summarize, rewrite, reorder, "
-    "translate, or add anything that is not in the input.\n"
-    "- Drop everything that is not part of this one posting: menus, sign-in "
-    "prompts, cookie banners, footers, ads, share buttons, lists of other jobs.\n"
-    "- Output plain text only: no markdown fences, no commentary, no headings "
-    "you invented.\n"
-    "- If the input does not contain an actual job posting, output exactly: "
-    "NO_JOB_POSTING_FOUND"
-)
-
-
-def groq_chat(messages, temperature=0.3):
-    """Generic Groq chat-completions call. Returns the assistant message text."""
-    payload = {
-        "model": MODEL,
-        "temperature": temperature,
-        "messages": messages,
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(GROQ_URL, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", "Bearer " + GROQ_API_KEY)
-    req.add_header("User-Agent",
-                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-    return body["choices"][0]["message"]["content"]
-
-
-def format_assessment(skills):
-    """Turn [{skill, level}, ...] into a plain-text block, or '' if empty."""
-    if not skills:
-        return ""
-    lines = []
-    for item in skills:
-        if not isinstance(item, dict):
-            continue
-        name = (item.get("skill") or "").strip()
-        level = (item.get("level") or "").strip()
-        if name and level:
-            lines.append("- %s: %s" % (name, level))
-    if not lines:
-        return ""
-    return (
-        "CANDIDATE SELF-ASSESSMENT (the candidate's own first-person ratings of "
-        "their experience with skills this job asks for; treat each as a truthful "
-        "statement by the candidate):\n" + "\n".join(lines)
-    )
-
-
-def call_groq(redacted_resume, job_text, skills=None):
-    assessment = format_assessment(skills)
-    user_parts = ["JOB DESCRIPTION:\n" + job_text]
-    if assessment:
-        user_parts.append(assessment)
-    user_parts.append("RESUME (sensitive parts already redacted):\n" + redacted_resume)
-    user_content = "\n\n---\n\n".join(user_parts)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
-    return groq_chat(messages, temperature=0.3)
-
-
-def extract_json(text):
-    """Best-effort: pull the first JSON object or array out of a text blob."""
-    text = (text or "").strip()
-    for open_ch, close_ch in (("{", "}"), ("[", "]")):
-        start = text.find(open_ch)
-        end = text.rfind(close_ch)
-        if start != -1 and end > start:
-            try:
-                return json.loads(text[start:end + 1])
-            except ValueError:
-                continue
-    return None
-
-
-def parse_changes(raw):
-    """Turn the model's raw reply into ({changes, gaps}) or None on failure."""
-    parsed = extract_json(raw)
-    if not isinstance(parsed, dict):
-        return None
-    raw_changes = parsed.get("changes")
-    if not isinstance(raw_changes, list):
-        return None
-    changes = []
-    for ch in raw_changes:
-        if not isinstance(ch, dict):
-            continue
-        original = ch.get("original")
-        suggested = ch.get("suggested")
-        if not isinstance(original, str) or not isinstance(suggested, str):
-            continue
-        original, suggested = original.strip("\n"), suggested.strip("\n")
-        if not original.strip() or not suggested.strip():
-            continue
-        if original.strip() == suggested.strip():
-            continue
-        changes.append({
-            "section": str(ch.get("section") or "").strip(),
-            "original": original,
-            "suggested": suggested,
-            "why": str(ch.get("why") or "").strip(),
-        })
-    gaps_raw = parsed.get("gaps")
-    gaps = []
-    if isinstance(gaps_raw, list):
-        gaps = [g.strip() for g in gaps_raw if isinstance(g, str) and g.strip()]
-    if not changes and not gaps:
-        return None
-    return {"changes": changes, "gaps": gaps}
-
-
-def extract_skills(job_text):
-    messages = [
-        {"role": "system", "content": SKILLS_SYSTEM_PROMPT},
-        {"role": "user", "content": "JOB DESCRIPTION:\n" + job_text},
-    ]
-    raw = groq_chat(messages, temperature=0.1)
-    parsed = extract_json(raw)
-    if isinstance(parsed, dict):
-        maybe = parsed.get("skills", [])
-    elif isinstance(parsed, list):
-        maybe = parsed
-    else:
-        maybe = []
-    skills, seen = [], set()
-    for s in maybe:
-        if isinstance(s, str):
-            label = s.strip()
-        elif isinstance(s, dict):
-            label = (s.get("skill") or s.get("name") or "").strip()
-        else:
-            label = ""
-        key = label.lower()
-        if label and key not in seen:
-            seen.add(key)
-            skills.append(label)
-    return skills[:15]
-
-
-# ---------- fetching a job posting from a URL (best-effort) ----------
-
-MAX_FETCH_BYTES = 3_000_000      # don't slurp more than ~3 MB of HTML
-MAX_JOB_CHARS = 20_000           # cap the text we hand back to the UI
-
-BROWSER_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
-    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-               "*/*;q=0.8"),
-    "Accept-Language": "en;q=0.9",
-    "Accept-Encoding": "gzip, identity",
-}
-
-
-class _TextExtractor(HTMLParser):
-    """Very small HTML -> visible-text converter (no third-party deps)."""
-
-    SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "head",
-                 "iframe", "nav", "form", "button"}
-    BLOCK_TAGS = {"p", "div", "section", "article", "header", "footer",
-                  "main", "aside", "li", "ul", "ol", "table", "tr", "td",
-                  "th", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
-                  "blockquote", "pre", "dt", "dd"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self._skip_depth = 0
-        self.parts = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self.SKIP_TAGS:
-            self._skip_depth += 1
-        elif tag in self.BLOCK_TAGS:
-            self.parts.append("\n")
-
-    def handle_startendtag(self, tag, attrs):
-        if tag in self.BLOCK_TAGS:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag):
-        if tag in self.SKIP_TAGS:
-            if self._skip_depth:
-                self._skip_depth -= 1
-        elif tag in self.BLOCK_TAGS:
-            self.parts.append("\n")
-
-    def handle_data(self, data):
-        if not self._skip_depth:
-            self.parts.append(data)
-
-
-def html_to_text(html_text):
-    parser = _TextExtractor()
-    try:
-        parser.feed(html_text)
-        parser.close()
-    except Exception:
-        pass  # keep whatever was extracted before the parser choked
-    text = "".join(parser.parts)
-    lines = [" ".join(ln.split()) for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-    return "\n".join(lines)
-
-
-def fetch_job_page(url):
-    """Fetch a URL and return the page's visible text. Raises ValueError with a
-    user-facing message when the page can't be fetched or yields no usable text."""
-    url = (url or "").strip()
-    if not url.lower().startswith(("http://", "https://")):
-        raise ValueError("The link must start with http:// or https://.")
-    req = urllib.request.Request(url)
-    for key, val in BROWSER_HEADERS.items():
-        req.add_header(key, val)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read(MAX_FETCH_BYTES)
-            encoding = (resp.headers.get("Content-Encoding") or "").lower()
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            final_url = resp.geturl().lower()  # where we landed after redirects
-    except urllib.error.HTTPError as exc:
-        raise ValueError(
-            "The site answered with HTTP %s. Many job boards block automated "
-            "fetches - please copy the posting text and paste it instead." % exc.code)
-    except Exception as exc:
-        raise ValueError(
-            "Couldn't reach that link (%s). Check the URL, or copy the posting "
-            "text and paste it instead." % exc)
-    if "gzip" in encoding:
-        try:
-            raw = gzip.decompress(raw)
-        except OSError:
-            pass
-    if ctype and ("html" not in ctype and "text" not in ctype):
-        raise ValueError(
-            "That link isn't an HTML page (server says '%s'). Please paste the "
-            "posting text instead." % ctype.split(";")[0])
-    charset = "utf-8"
-    if "charset=" in ctype:
-        charset = ctype.split("charset=")[-1].split(";")[0].strip() or "utf-8"
-    try:
-        html_text = raw.decode(charset, "replace")
-    except LookupError:
-        html_text = raw.decode("utf-8", "replace")
-    text = html_to_text(html_text)
-    # Detect login walls (e.g. LinkedIn's authwall): signal 1 is the URL we were
-    # redirected to; signal 2 is a fallback requiring >=2 login-page phrases in
-    # the text, so a job page that merely mentions "sign in" once isn't rejected.
-    wall = any(k in final_url for k in ("authwall", "login", "signin", "checkpoint"))
-    if not wall:
-        markers = ("sign in", "join now", "forgot password", "keep me signed in")
-        wall = sum(1 for m in markers if m in text.lower()) >= 2
-    if wall:
-        raise ValueError(
-            "The site returned a login page instead of the posting (LinkedIn and "
-            "similar boards require sign-in). Please copy the posting text and "
-            "paste it instead.")
-    if len(text) < 200:
-        raise ValueError(
-            "The page returned almost no readable text - it's probably rendered "
-            "with JavaScript or behind a login (common on LinkedIn, Workday, "
-            "etc.). Please copy the posting text and paste it instead.")
-    if len(text) > MAX_JOB_CHARS:
-        text = text[:MAX_JOB_CHARS] + "\n\n[... page text truncated ...]"
-    return text
-
-
-def clean_job_text(raw_text):
-    """Second-pass Groq call: strip scraped-page clutter (menus, footers, cookie
-    banners) so only the posting remains. Returns the cleaned text, or raises
-    ValueError when the reply is unusable; the caller falls back to raw_text."""
-    messages = [
-        {"role": "system", "content": CLEAN_SYSTEM_PROMPT},
-        {"role": "user", "content": "SCRAPED PAGE TEXT:\n" + raw_text},
-    ]
-    cleaned = (groq_chat(messages, temperature=0.0) or "").strip()
-    if cleaned.startswith("```"):          # tolerate accidental markdown fences
-        first_nl = cleaned.find("\n")
-        if first_nl != -1:
-            cleaned = cleaned[first_nl + 1:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
-    if "NO_JOB_POSTING_FOUND" in cleaned[:80]:
-        raise ValueError("the model found no job posting in the page text")
-    if len(cleaned) < 200:
-        raise ValueError("the cleaned text came back suspiciously short")
-    if len(cleaned) > len(raw_text):
-        raise ValueError("the cleaned text grew - the model may have added "
-                         "content, so it can't be trusted")
-    return cleaned
-
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def _send(self, code, ctype, body_bytes):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body_bytes)))
-        self.end_headers()
-        self.wfile.write(body_bytes)
-
-    def _json(self, code, obj):
-        self._send(code, "application/json", json.dumps(obj).encode("utf-8"))
-
-    def _read_body(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(length) or b"{}")
-
-    def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
-        else:
-            self._json(404, {"error": "not found"})
-
-    def do_POST(self):
-        if self.path == "/api/skills":
-            self.handle_skills()
-        elif self.path == "/api/rewrite":
-            self.handle_rewrite()
-        elif self.path == "/api/fetch_job":
-            self.handle_fetch_job()
-        else:
-            self._json(404, {"error": "not found"})
-
-    def handle_fetch_job(self):
-        try:
-            payload = self._read_body()
-            url = payload.get("url", "")
-        except (ValueError, TypeError) as exc:
-            self._json(400, {"error": "Bad request: %s" % exc})
-            return
-        if not (url or "").strip():
-            self._json(400, {"error": "Paste a link to the job posting first."})
-            return
-        try:
-            text = fetch_job_page(url)
-        except ValueError as exc:
-            self._json(422, {"error": str(exc)})
-            return
-        except Exception as exc:
-            self._json(502, {"error":
-                "Fetching failed: %s. Please paste the posting text instead." % exc})
-            return
-        # Second pass: ask Groq to strip menus/footers so the later skills and
-        # rewrite calls see only the posting. Any failure falls back to the raw
-        # scrape - this step must never make fetching worse.
-        if not GROQ_API_KEY:
-            self._json(200, {"text": text, "cleaned": False,
-                             "note": "GROQ_API_KEY not set, so no AI clean-up was done"})
-            return
-        try:
-            cleaned = clean_job_text(text)
-            self._json(200, {"text": cleaned, "cleaned": True,
-                             "raw_chars": len(text), "clean_chars": len(cleaned)})
-        except Exception as exc:
-            self._json(200, {"text": text, "cleaned": False,
-                             "note": "AI clean-up failed (%s)" % exc})
-
-    def handle_skills(self):
-        try:
-            payload = self._read_body()
-            job = payload.get("job", "")
-        except (ValueError, TypeError) as exc:
-            self._json(400, {"error": "Bad request: %s" % exc})
-            return
-        if not job.strip():
-            self._json(400, {"error": "Please paste the job description first."})
-            return
-        if not GROQ_API_KEY:
-            self._json(500, {"error":
-                "GROQ_API_KEY is not set. Set it in your terminal and restart. "
-                "See the setup notes at the top of resume_adapter.py."})
-            return
-        try:
-            skills = extract_skills(job)
-            self._json(200, {"skills": skills})
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:800]
-            self._json(502, {"error": "Groq returned HTTP %s. %s" % (exc.code, detail)})
-        except Exception as exc:
-            self._json(502, {"error": "Call failed: %s" % exc})
-
-    def handle_rewrite(self):
-        try:
-            payload = self._read_body()
-            resume = payload.get("resume", "")
-            job = payload.get("job", "")
-            skills = payload.get("skills", [])
-        except (ValueError, TypeError) as exc:
-            self._json(400, {"error": "Bad request: %s" % exc})
-            return
-        if not resume.strip() or not job.strip():
-            self._json(400, {"error": "Please provide both a job description and a resume."})
-            return
-        if not isinstance(skills, list):
-            skills = []
-        if not GROQ_API_KEY:
-            self._json(500, {"error":
-                "GROQ_API_KEY is not set. Set it in your terminal and restart. "
-                "See the setup notes at the top of resume_adapter.py."})
-            return
-        try:
-            raw = call_groq(resume, job, skills)
-            structured = parse_changes(raw)
-            if structured is None:
-                # Model ignored the JSON format; let the UI show the raw text.
-                self._json(200, {"raw": raw})
-            else:
-                self._json(200, structured)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:800]
-            self._json(502, {"error": "Groq returned HTTP %s. %s" % (exc.code, detail)})
-        except Exception as exc:
-            self._json(502, {"error": "Call failed: %s" % exc})
-
-    def log_message(self, *args):
-        return
-
-
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -622,13 +106,341 @@ PAGE = r"""<!DOCTYPE html>
   .modal h3 { margin:0 0 8px; font-size:15px; }
   .modal p { margin:0 0 14px; color:var(--mut); font-size:13px; line-height:1.5; }
   .modal .row { justify-content:flex-end; margin-top:0; }
+
+  /* ===============================
+     FUTURISTIC NEON UI OVERRIDE
+     =============================== */
+
+  :root {
+    --bg: #050713;
+    --panel: rgba(12, 18, 34, 0.72);
+    --line: rgba(108, 246, 255, 0.22);
+    --ink: #eef8ff;
+    --mut: #8fa8c7;
+    --accent: #6cf6ff;
+    --accent2: #9b5cff;
+    --warn: #ffd166;
+    --bad: #ff5c8a;
+    --ok: #65ffb8;
+    --glow: 0 0 24px rgba(108, 246, 255, 0.28);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--accent) #090d18;
+  }
+
+  body {
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at 15% 10%, rgba(108, 246, 255, 0.18), transparent 28%),
+      radial-gradient(circle at 85% 0%, rgba(155, 92, 255, 0.20), transparent 30%),
+      radial-gradient(circle at 50% 100%, rgba(101, 255, 184, 0.10), transparent 34%),
+      linear-gradient(135deg, #03040b 0%, #07111f 48%, #090414 100%);
+    color: var(--ink);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    letter-spacing: 0.01em;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: -1;
+    background-image:
+      linear-gradient(rgba(108, 246, 255, 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(108, 246, 255, 0.045) 1px, transparent 1px);
+    background-size: 44px 44px;
+    mask-image: linear-gradient(to bottom, rgba(0,0,0,0.85), transparent 85%);
+  }
+
+  body::after {
+    content: "";
+    position: fixed;
+    inset: -30%;
+    pointer-events: none;
+    z-index: -2;
+    background:
+      conic-gradient(
+        from 120deg,
+        rgba(108, 246, 255, 0.08),
+        rgba(155, 92, 255, 0.10),
+        rgba(101, 255, 184, 0.07),
+        rgba(108, 246, 255, 0.08)
+      );
+    filter: blur(80px);
+    animation: driftGlow 18s ease-in-out infinite alternate;
+  }
+
+  @keyframes driftGlow {
+    from { transform: translate3d(-2%, -1%, 0) rotate(0deg); }
+    to   { transform: translate3d(2%, 1%, 0) rotate(8deg); }
+  }
+
+  header {
+    position: relative;
+    padding: 24px 28px;
+    border-bottom: 1px solid rgba(108, 246, 255, 0.22);
+    background:
+      linear-gradient(90deg, rgba(108,246,255,.10), transparent 45%),
+      rgba(5, 7, 19, 0.70);
+    backdrop-filter: blur(18px);
+    box-shadow: 0 14px 40px rgba(0,0,0,.35);
+  }
+
+  header h1 {
+    font-size: 24px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: linear-gradient(90deg, #ffffff, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    text-shadow: 0 0 30px rgba(108,246,255,.25);
+  }
+
+  header p {
+    max-width: 950px;
+    color: #a9bad4;
+  }
+
+  .wrap {
+    gap: 20px;
+    padding: 24px 28px;
+  }
+
+  .panel {
+    position: relative;
+    overflow: hidden;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.055), rgba(255,255,255,.018)),
+      var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    padding: 18px;
+    backdrop-filter: blur(18px);
+    box-shadow:
+      0 24px 80px rgba(0,0,0,.35),
+      inset 0 1px 0 rgba(255,255,255,.08),
+      var(--glow);
+  }
+
+  .panel::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border-radius: inherit;
+    background:
+      linear-gradient(120deg, rgba(108,246,255,.22), transparent 22%, transparent 72%, rgba(155,92,255,.16));
+    opacity: .45;
+  }
+
+  .panel h2 {
+    position: relative;
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: 0.16em;
+    text-shadow: 0 0 14px rgba(108,246,255,.42);
+  }
+
+  textarea,
+  input[type="url"],
+  .skill-row select {
+    background: rgba(3, 7, 18, 0.72);
+    color: var(--ink);
+    border: 1px solid rgba(108,246,255,.22);
+    border-radius: 14px;
+    box-shadow:
+      inset 0 0 0 1px rgba(255,255,255,.025),
+      0 0 0 rgba(108,246,255,0);
+    outline: none;
+    transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
+  }
+
+  textarea:focus,
+  input[type="url"]:focus,
+  .skill-row select:focus {
+    border-color: rgba(108,246,255,.75);
+    box-shadow:
+      0 0 0 3px rgba(108,246,255,.10),
+      0 0 26px rgba(108,246,255,.20);
+  }
+
+  textarea::placeholder,
+  input::placeholder {
+    color: rgba(169, 186, 212, 0.56);
+  }
+
+  button {
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #020510;
+    border: 1px solid rgba(255,255,255,.18);
+    border-radius: 999px;
+    padding: 10px 16px;
+    font-weight: 800;
+    letter-spacing: .03em;
+    box-shadow:
+      0 0 22px rgba(108,246,255,.28),
+      0 10px 28px rgba(0,0,0,.28);
+    transition: transform .18s ease, box-shadow .18s ease, filter .18s ease;
+  }
+
+  button:hover:not(:disabled) {
+    transform: translateY(-1px);
+    filter: brightness(1.08);
+    box-shadow:
+      0 0 30px rgba(108,246,255,.42),
+      0 14px 32px rgba(0,0,0,.38);
+  }
+
+  button:active:not(:disabled) {
+    transform: translateY(0);
+  }
+
+  button.ghost {
+    background: rgba(8, 14, 28, .55);
+    color: var(--accent);
+    border: 1px solid rgba(108,246,255,.34);
+    box-shadow: inset 0 0 18px rgba(108,246,255,.045);
+  }
+
+  button.ghost:hover:not(:disabled) {
+    background: rgba(108,246,255,.10);
+  }
+
+  .note {
+    color: #9fb1cc;
+  }
+
+  .sent,
+  .result,
+  .dblock,
+  details.fullver,
+  details.fullver .ftext {
+    background:
+      linear-gradient(180deg, rgba(108,246,255,.035), rgba(155,92,255,.025)),
+      rgba(3, 7, 18, .74);
+    border-color: rgba(108,246,255,.20);
+    border-radius: 14px;
+  }
+
+  .chip {
+    background: rgba(108,246,255,.08);
+    border: 1px solid rgba(108,246,255,.26);
+    color: var(--ink);
+    box-shadow: inset 0 0 16px rgba(108,246,255,.04);
+  }
+
+  .chip code {
+    color: var(--accent);
+    text-shadow: 0 0 10px rgba(108,246,255,.5);
+  }
+
+  .skill-row,
+  .change {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.012)),
+      rgba(4, 9, 22, .76);
+    border: 1px solid rgba(108,246,255,.20);
+    border-radius: 15px;
+  }
+
+  .csec {
+    color: var(--accent);
+    text-shadow: 0 0 12px rgba(108,246,255,.42);
+  }
+
+  .dblock.old {
+    border-left: 3px solid var(--bad);
+  }
+
+  .dblock.new {
+    border-left: 3px solid var(--ok);
+  }
+
+  .dblock .rm {
+    background: rgba(255, 92, 138, .22);
+    color: #ffd9e4;
+  }
+
+  .dblock .add {
+    background: rgba(101, 255, 184, .16);
+    color: #d9ffef;
+  }
+
+  .banner {
+    border-radius: 14px;
+    backdrop-filter: blur(12px);
+  }
+
+  .banner.ok {
+    background: rgba(101, 255, 184, .10);
+    border-color: rgba(101, 255, 184, .55);
+    color: var(--ok);
+  }
+
+  .banner.warn {
+    background: rgba(255, 209, 102, .10);
+    border-color: rgba(255, 209, 102, .55);
+    color: var(--warn);
+  }
+
+  .banner.bad {
+    background: rgba(255, 92, 138, .10);
+    border-color: rgba(255, 92, 138, .55);
+    color: var(--bad);
+  }
+
+  .modal-back {
+    background: rgba(1, 4, 12, .72);
+    backdrop-filter: blur(10px);
+  }
+
+  .modal {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.025)),
+      rgba(8, 13, 28, .92);
+    border: 1px solid rgba(108,246,255,.28);
+    border-radius: 20px;
+    box-shadow:
+      0 24px 90px rgba(0,0,0,.55),
+      0 0 36px rgba(108,246,255,.20);
+  }
+
+  kbd {
+    background: rgba(108,246,255,.08);
+    border-color: rgba(108,246,255,.28);
+    color: var(--accent);
+  }
+
+  ::selection {
+    background: rgba(108,246,255,.35);
+    color: #ffffff;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    body::after {
+      animation: none;
+    }
+
+    button,
+    textarea,
+    input[type="url"],
+    .skill-row select {
+      transition: none;
+    }
+  }
+
 </style>
 </head>
 <body>
 <header>
-  <h1>Resume Adapter &mdash; runs locally</h1>
-  <p>Sensitive text you redact is replaced <b>in your browser</b> before anything is sent.
-     Only the redacted resume, the job text, and your skill ratings reach Groq. Originals are restored locally.</p>
+  <h1>Resume Adapter // Neural CV Tailor</h1>
+  <p>Local-first resume intelligence. Redact sensitive data, scan job requirements, and generate targeted CV upgrades through a secure neon workspace.</p>
 </header>
 
 <div class="wrap">
@@ -1200,15 +1012,3 @@ $("copyBtn").onclick = () => {
 </script>
 </body>
 </html>"""
-
-
-if __name__ == "__main__":
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as httpd:
-        print("Resume Adapter running at http://127.0.0.1:%d" % PORT)
-        print("GROQ_API_KEY set:", bool(GROQ_API_KEY), "| model:", MODEL)
-        print("Press Ctrl+C to stop.")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nStopped.")
